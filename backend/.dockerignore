@@ -1,0 +1,8 @@
+.git
+/bin
+/api
+*.test
+*.out
+.env
+.env.*
+!.env.example
