@@ -1,5 +1,4 @@
-# Dev-only compose: runs the frontend Vite dev server.
-# backend/ is intentionally not containerized yet.
+# Dev-only compose: runs the frontend Vite dev server and the Go backend.
 services:
   frontend:
     build:
@@ -15,11 +14,16 @@ services:
       # Vite already binds 0.0.0.0:5173 (see frontend/vite.config.ts).
       # Set CHOKIDAR_USEPOLLING=true if HMR misses changes (Docker Desktop / VM).
       CHOKIDAR_USEPOLLING: "${CHOKIDAR_USEPOLLING:-false}"
+      # Container-to-container: proxy /api to the backend service, not localhost.
+      VITE_PROXY_TARGET: "http://backend:8080"
+    depends_on:
+      - backend
 
-    # TODO: when the backend exists, add a `backend` service on :8080 and change
-    # the frontend proxy target in frontend/vite.config.ts from
-    # http://localhost:8080 to http://backend:8080 (inside a container,
-    # localhost is the frontend itself).
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8080:8080"
 
 volumes:
   frontend_node_modules:
