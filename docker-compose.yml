@@ -1,0 +1,25 @@
+# Dev-only compose: runs the frontend Vite dev server.
+# backend/ is intentionally not containerized yet.
+services:
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      # Bind-mount source for HMR...
+      - ./frontend:/app
+      # ...but keep the image's node_modules (host installs are platform-specific).
+      - frontend_node_modules:/app/node_modules
+    environment:
+      # Vite already binds 0.0.0.0:5173 (see frontend/vite.config.ts).
+      # Set CHOKIDAR_USEPOLLING=true if HMR misses changes (Docker Desktop / VM).
+      CHOKIDAR_USEPOLLING: "${CHOKIDAR_USEPOLLING:-false}"
+
+    # TODO: when the backend exists, add a `backend` service on :8080 and change
+    # the frontend proxy target in frontend/vite.config.ts from
+    # http://localhost:8080 to http://backend:8080 (inside a container,
+    # localhost is the frontend itself).
+
+volumes:
+  frontend_node_modules:
