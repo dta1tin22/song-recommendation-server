@@ -1,0 +1,1171 @@
+openapi: 3.0.3
+
+info:
+  title: Music Backend API
+  version: 0.1.0
+  description: |
+    Draft contract for the Music Backend API.
+
+    ### Authentication
+    The API has two credential types, and an operation accepts exactly one:
+
+    - **JWT** — `POST /api/v1/auth/login` issues an HS256 JWT (with a unique
+      `jti`, so every access token is distinct even when two are minted in the
+      same second) plus a long-lived refresh token. Send it as
+      `Authorization: Bearer <token>`; currently every `/api/v1/api-keys`
+      operation requires it.
+    - **API key** — an opaque `mk_…` secret created by
+      `POST /api/v1/api-keys`, sent as `X-API-Key: mk_…`. This is the credential
+      for external plugins. No operation is wired to it yet: the scheme is
+      declared in `securitySchemes` and will be attached to plugin-facing paths
+      as they are added.
+
+    Refresh tokens are opaque, single-use secrets: only a SHA-256 hash is stored
+    server-side. `POST /api/v1/auth/refresh` exchanges one for a new access token
+    and a *rotated* refresh token — the presented token is consumed, so clients
+    must replace their stored copy on every refresh. Losing it means logging in
+    again. `POST /api/v1/auth/logout` deletes the session.
+
+    ### API keys
+    `POST /api/v1/api-keys` creates a scoped key for the authenticated user. The
+    raw key (`mk_` followed by 32 random bytes encoded as URL-safe base64) is
+    returned exactly once and is not recoverable; only its 12-character prefix
+    and SHA-256 hash are stored. Listings show the prefix only. `DELETE` performs
+    a soft revoke (`revoked_at`), after which the key disappears from listings.
+
+    Keys are also the credential external plugins use to call the API, sent in the
+    `X-API-Key` header. Using a key stamps `last_used_at`; a key that is unknown,
+    revoked or expired is rejected with the same `401 unauthorized` as a bad JWT.
+
+    ### Account lockout
+    Five consecutive failed password attempts lock an account for 15 minutes.
+    While locked, every login attempt returns `423 account_locked`, including
+    attempts with the correct password. The lock expires on its own; a
+    successful login resets the counter.
+
+    ### Conventions
+    - All request and response bodies are `application/json`.
+    - Request bodies are capped at 1 MiB and must contain exactly one JSON
+      object. Unknown fields are rejected with `400`.
+    - Usernames and emails are normalised to lower case by the server; the
+      stored and returned values are lower case.
+    - Every error response uses the same envelope:
+      `{"error":{"code":"...","message":"..."}}`. That includes router-level
+      failures: an unknown path returns `404 not_found` and a known path with
+      the wrong method returns `405 method_not_allowed`.
+
+tags:
+  - name: Auth
+    description: Registration, login, refresh-token rotation and logout.
+  - name: API Keys
+    description: Create, list and revoke API keys for the authenticated user.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development server
+
+paths:
+  /api/v1/auth/register:
+    post:
+      tags:
+        - Auth
+      summary: Register a new user
+      operationId: registerUser
+      description: |
+        Creates an account with the role `user`. The role is assigned by the
+        server and cannot be supplied by the client; a `role` field in the
+        request body is rejected as an unknown field.
+
+        The password is hashed with bcrypt and never returned.
+      requestBody:
+        required: true
+        description: |
+          Exactly one JSON object, maximum 1 MiB. Unknown fields cause a 400.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            examples:
+              valid:
+                summary: Valid registration
+                value:
+                  username: alice
+                  email: alice@example.com
+                  password: password123
+      responses:
+        '201':
+          description: User created. The response never contains the password hash.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+              examples:
+                created:
+                  summary: Newly created user
+                  value:
+                    id: 1
+                    username: alice
+                    email: alice@example.com
+                    role: user
+                    is_active: true
+                    email_verified: false
+                    created_at: '2026-11-17T04:02:56.821538+07:00'
+        '400':
+          description: |
+            The request body was rejected.
+
+            - `invalid_body` — not a single valid JSON object, an unknown field,
+              a field with the wrong type, an empty body, or a body over 1 MiB.
+            - `invalid_input` — a field failed validation: username must be 3-100
+              characters of letters, digits, `_`, `-` or `.`; email must be a
+              valid address of at most 255 characters; password must be 8-72
+              bytes (bcrypt ignores anything after 72 bytes, so longer passwords
+              are rejected rather than truncated).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                unknownField:
+                  summary: Client tried to set a field the server assigns
+                  value:
+                    error:
+                      code: invalid_body
+                      message: 'json: unknown field "role"'
+                invalidPassword:
+                  summary: Password too short
+                  value:
+                    error:
+                      code: invalid_input
+                      message: password must be at least 8 characters
+                invalidEmail:
+                  summary: Malformed email
+                  value:
+                    error:
+                      code: invalid_input
+                      message: email is not a valid address
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '409':
+          description: |
+            Username or email is already taken, determined by the corresponding
+            PostgreSQL unique constraint.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                usernameTaken:
+                  summary: Duplicate username
+                  value:
+                    error:
+                      code: username_taken
+                      message: username is already taken
+                emailTaken:
+                  summary: Duplicate email
+                  value:
+                    error:
+                      code: email_taken
+                      message: email is already registered
+        '413':
+          description: The request body exceeds the 1 MiB limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                payloadTooLarge:
+                  value:
+                    error:
+                      code: payload_too_large
+                      message: request body is too large
+        '500':
+          description: Unexpected server or database failure. Details are logged, not returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                internal:
+                  value:
+                    error:
+                      code: internal_error
+                      message: internal server error
+
+  /api/v1/auth/login:
+    post:
+      tags:
+        - Auth
+      summary: Log in and obtain an access token and refresh token
+      operationId: loginUser
+      description: |
+        Verifies the credentials and returns a signed HS256 JWT plus a refresh
+        token. The access token's claims are:
+
+        - `sub` — user ID as a string
+        - `username` — the user's username
+        - `role` — `user` or `admin`
+        - `iss` — `music-backend`
+        - `jti` — random UUIDv4, unique per issued token
+        - `iat` / `exp` — issue and expiry timestamps (24 hours by default)
+
+        The refresh token is returned in clear text exactly once and is stored
+        server-side only as a SHA-256 hash. Its lifetime defaults to 168 hours.
+
+        Every authentication failure returns the same `401` response, so the API
+        never reveals whether a username exists or whether an account is
+        inactive. The single deliberate exception is `423` for a locked account,
+        which is accepted in exchange for clearer client behaviour.
+      requestBody:
+        required: true
+        description: |
+          Exactly one JSON object, maximum 1 MiB. Unknown fields cause a 400.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              valid:
+                value:
+                  username: alice
+                  password: password123
+      responses:
+        '200':
+          description: Authenticated. The response never contains the password hash.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+              examples:
+                success:
+                  value:
+                    token: >-
+                      eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6ImFsaWNlIiwicm9sZSI6InVzZXIiLCJpc3MiOiJtdXNpYy1iYWNrZW5kIiwic3ViIjoiMSIsImV4cCI6MTc5NDk0OTM3NiwiaWF0IjoxNzk0ODYyOTc2fQ.5vJ0k3J1o4Q0Yw9kZ0m8sX2c4b6n8pQ1rT3uV5wX7yA
+                    expires_at: '2026-11-18T04:02:23.3566154+07:00'
+                    refresh_token: 9Xr3kQ1oZ2mW8pY4vB6nC0sD5fG7hJ1lK3nM5pR7tV9
+                    refresh_token_expires_at: '2026-11-24T04:02:23.3566154+07:00'
+                    user:
+                      id: 1
+                      username: alice
+                      email: alice@example.com
+                      role: user
+                      is_active: true
+                      email_verified: false
+                      created_at: '2026-11-17T04:02:23.017285+07:00'
+        '400':
+          description: |
+            The request body was rejected.
+
+            - `invalid_body` — not a single valid JSON object, an unknown field,
+              a field with the wrong type, an empty body, or a body over 1 MiB.
+            - `invalid_input` — username or password was empty.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingFields:
+                  summary: Empty credentials
+                  value:
+                    error:
+                      code: invalid_input
+                      message: username and password are required
+                malformed:
+                  value:
+                    error:
+                      code: invalid_body
+                      message: request body is empty
+        '401':
+          description: |
+            Invalid credentials. Returned identically for an unknown username, a
+            wrong password, and an inactive account, so the response cannot be
+            used to enumerate users.
+
+            Also returned for a refresh token that is unknown, expired, revoked
+            or already rotated, with code `invalid_refresh_token`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidCredentials:
+                  value:
+                    error:
+                      code: invalid_credentials
+                      message: invalid username or password
+        '423':
+          description: |
+            The account is inside its lockout window after five consecutive
+            failed password attempts. Returned even when the supplied password is
+            correct, and deliberately omits the remaining attempt count and the
+            unlock time. The attempt that *reaches* the threshold still returns
+            `401`, so the threshold itself is not confirmed to the client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                locked:
+                  value:
+                    error:
+                      code: account_locked
+                      message: account is temporarily locked, try again later
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          description: The request body exceeds the 1 MiB limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                payloadTooLarge:
+                  value:
+                    error:
+                      code: payload_too_large
+                      message: request body is too large
+        '500':
+          description: Unexpected server or database failure. Details are logged, not returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                internal:
+                  value:
+                    error:
+                      code: internal_error
+                      message: internal server error
+
+  /api/v1/auth/refresh:
+    post:
+      tags:
+        - Auth
+      summary: Exchange a refresh token for a new token pair
+      operationId: refreshToken
+      description: |
+        Consumes the presented refresh token and returns a new access token plus
+        a new refresh token. Consumption is atomic, so a given refresh token can
+        succeed exactly once: replaying it — or racing two refreshes with it —
+        returns `401 invalid_refresh_token`.
+
+        Clients **must** replace their stored refresh token with the one in the
+        response. The old value is dead the moment this call succeeds, and losing
+        the new value means logging in again.
+
+        Rotation preserves the session's original user agent and IP address. The
+        user is re-read from the database on every refresh, so deactivating an
+        account immediately stops it from minting access tokens.
+
+        The response omits the user object; use a profile endpoint when one
+        exists, or re-login, if the account representation is needed.
+      requestBody:
+        required: true
+        description: |
+          Exactly one JSON object, maximum 1 MiB. Unknown fields cause a 400.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+            examples:
+              valid:
+                value:
+                  refresh_token: 9Xr3kQ1oZ2mW8pY4vB6nC0sD5fG7hJ1lK3nM5pR7tV9
+      responses:
+        '200':
+          description: |
+            The old refresh token has been consumed. Store the new pair; the
+            refresh token in this response supersedes the one that was sent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshResponse'
+              examples:
+                rotated:
+                  value:
+                    token: >-
+                      eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VybmFtZSI6ImFsaWNlIiwicm9sZSI6InVzZXIiLCJpc3MiOiJtdXNpYy1iYWNrZW5kIiwic3ViIjoiMSIsImp0aSI6IjNmYThhOWMyLTQxNTEtNGQ3ZS04YjFjLTRhMmQ2ZTdmOGMwMSIsImV4cCI6MTc5NDk0OTM3NiwiaWF0IjoxNzk0ODYyOTc2fQ.c2R4e6f8g0h2j4k6m8n0p2q4r6s8t0u2v4w6x8y0zA
+                    expires_at: '2026-11-18T04:02:23.3566154+07:00'
+                    refresh_token: 1aB2cD4eF6gH8iJ0kL2mN4oP6qR8sT0uV2wX4yZ6aB
+                    refresh_token_expires_at: '2026-11-24T04:02:23.3566154+07:00'
+        '400':
+          description: |
+            The request body was rejected.
+
+            - `invalid_body` — not a single valid JSON object, an unknown field,
+              a field with the wrong type, an empty body, or a body over 1 MiB.
+            - `invalid_input` — `refresh_token` was empty or whitespace.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingToken:
+                  value:
+                    error:
+                      code: invalid_input
+                      message: refresh token is required
+        '401':
+          description: |
+            The refresh token is unusable. Returned identically for an unknown,
+            expired, revoked, already-rotated, or deactivated-user token, so the
+            endpoint cannot be used to probe token validity.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                invalidToken:
+                  value:
+                    error:
+                      code: invalid_refresh_token
+                      message: invalid or expired refresh token
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          description: The request body exceeds the 1 MiB limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                payloadTooLarge:
+                  value:
+                    error:
+                      code: payload_too_large
+                      message: request body is too large
+        '500':
+          description: Unexpected server or database failure. Details are logged, not returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/auth/logout:
+    post:
+      tags:
+        - Auth
+      summary: Revoke a refresh token
+      operationId: logoutUser
+      description: |
+        Deletes the server-side session identified by the refresh token. Any
+        access token already issued keeps working until it expires: access tokens
+        are stateless and there is no revocation list yet.
+
+        The operation is idempotent and never reveals whether the token existed,
+        so an unknown, already-deleted or forged token returns the same `204`.
+
+        Authentication is by possession of the refresh token alone; no bearer
+        token is required.
+      requestBody:
+        required: true
+        description: |
+          Exactly one JSON object, maximum 1 MiB. Unknown fields cause a 400.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+            examples:
+              valid:
+                value:
+                  refresh_token: 1aB2cD4eF6gH8iJ0kL2mN4oP6qR8sT0uV2wX4yZ6aB
+      responses:
+        '204':
+          description: |
+            The session is gone. Also returned when the token never existed or was
+            already deleted; no body is sent.
+        '400':
+          description: |
+            The request body was rejected.
+
+            - `invalid_body` — not a single valid JSON object, an unknown field,
+              a field with the wrong type, an empty body, or a body over 1 MiB.
+            - `invalid_input` — `refresh_token` was empty or whitespace.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingToken:
+                  value:
+                    error:
+                      code: invalid_input
+                      message: refresh token is required
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          description: The request body exceeds the 1 MiB limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Unexpected server or database failure. Details are logged, not returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/api-keys:
+    post:
+      tags:
+        - API Keys
+      summary: Create an API key
+      operationId: createAPIKey
+      description: |
+        Creates a scoped API key for the authenticated user.
+
+        The `key` field is the raw credential and is returned exactly once. Only
+        its prefix and SHA-256 hash are stored, so it cannot be retrieved again:
+        if the response is lost, revoke the key and create another.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        description: |
+          Exactly one JSON object, maximum 1 MiB. Unknown fields cause a 400.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAPIKeyRequest'
+            examples:
+              minimal:
+                summary: Only the name; scopes and expiry are optional
+                value:
+                  name: CI pipeline
+              full:
+                value:
+                  name: CI pipeline
+                  scopes:
+                    - read
+                    - write
+                  expires_at: '2027-01-01T00:00:00Z'
+      responses:
+        '201':
+          description: |
+            Key created. The raw key is in `key`; copy it now. The response is
+            sent with `Cache-Control: no-store`.
+          headers:
+            Cache-Control:
+              description: Always `no-store`, because the body contains the raw key.
+              schema:
+                type: string
+                enum:
+                  - no-store
+            Location:
+              description: URL of the key, for later revocation.
+              schema:
+                type: string
+              example: /api/v1/api-keys/1
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAPIKeyResponse'
+              examples:
+                created:
+                  value:
+                    id: 1
+                    name: CI pipeline
+                    key: mk_9Xr3kQ1oZ2mW8pY4vB6nC0sD5fG7hJ1lK3nM5pR7tV
+                    key_prefix: mk_9Xr3kQ1o
+                    scopes:
+                      - read
+                      - write
+                    expires_at: null
+                    last_used_at: null
+                    created_at: '2026-11-17T05:00:00Z'
+        '400':
+          description: |
+            The request body was rejected.
+
+            - `invalid_body` — not a single valid JSON object, an unknown field,
+              a field with the wrong type, an empty body, or a body over 1 MiB.
+            - `invalid_input` — `name` is blank or longer than 100 characters;
+              `scopes` contains an unsupported value or an empty string;
+              `expires_at` is in the past.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                unknownScope:
+                  value:
+                    error:
+                      code: invalid_input
+                      message: 'unsupported scope "admin"'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '413':
+          description: The request body exceeds the 1 MiB limit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Unexpected server or database failure. Details are logged, not returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    get:
+      tags:
+        - API Keys
+      summary: List the authenticated user's active API keys
+      operationId: listAPIKeys
+      description: |
+        Returns the caller's keys, newest first. Revoked keys are omitted.
+
+        Responses contain only the prefix, never the raw key or its hash: the raw
+        value exists only in the `201` returned by creation.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Active keys belonging to the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIKeyListResponse'
+              examples:
+                list:
+                  value:
+                    api_keys:
+                      - id: 1
+                        name: CI pipeline
+                        key_prefix: mk_9Xr3kQ1o
+                        scopes:
+                          - read
+                          - write
+                        expires_at: null
+                        last_used_at: null
+                        created_at: '2026-11-17T05:00:00Z'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          description: Unexpected server or database failure. Details are logged, not returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/api-keys/{id}:
+    delete:
+      tags:
+        - API Keys
+      summary: Revoke an API key
+      operationId: revokeAPIKey
+      description: |
+        Soft-deletes the key by stamping `revoked_at`; the row is kept for audit
+        but no longer appears in listings.
+
+        Unknown, foreign and already-revoked keys all return the same `404`, so
+        key IDs cannot be enumerated across accounts.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Numeric key ID from the listing or the create response.
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+      responses:
+        '204':
+          description: The key is revoked. No body is sent.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            The key does not exist, belongs to another user, was already revoked,
+            or the path parameter is not a positive integer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                notFound:
+                  value:
+                    error:
+                      code: not_found
+                      message: api key not found
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          description: Unexpected server or database failure. Details are logged, not returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  responses:
+    NotFound:
+      description: |
+        No route matches the requested path. Emitted by the router, not by an
+        operation, so it applies to every path in this document.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            notFound:
+              value:
+                error:
+                  code: not_found
+                  message: resource not found
+
+    MethodNotAllowed:
+      description: |
+        The path exists but does not accept the requested HTTP method. The
+        response currently does not include an `Allow` header.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            methodNotAllowed:
+              value:
+                error:
+                  code: method_not_allowed
+                  message: method not allowed
+
+    Unauthorized:
+      description: |
+        The request did not carry a usable access token: the header is missing or
+        malformed, the token is expired, signed with another key, uses an
+        algorithm other than HS256, or has the wrong issuer. The specific reason
+        is deliberately not disclosed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unauthorized:
+              value:
+                error:
+                  code: unauthorized
+                  message: authentication required
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        HS256 JWT issued by `POST /api/v1/auth/login`. Required by every
+        `/api/v1/api-keys` operation. The server validates the signature,
+        algorithm, issuer and expiry; it does not yet consult a revocation list
+        or re-check the account's active state on each request.
+
+        This scheme authenticates web users; external plugins use `apiKeyAuth`
+        instead, and the two are never accepted on the same operation.
+
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        Opaque API key created by `POST /api/v1/api-keys`, intended for external
+        plugins. The value is `mk_` followed by 32 random bytes encoded as
+        URL-safe base64 (46 characters); the server stores only its SHA-256 hash
+        and a 12-character display prefix.
+
+        Send the raw key in the `X-API-Key` header. The server hashes the
+        presented value, looks the digest up in `api_keys`, and rejects the
+        request with `401 unauthorized` if the key is unknown, revoked or
+        expired. The specific reason is deliberately not disclosed. Keys carry
+        `read`/`write` scopes, but scopes are stored and not enforced yet.
+
+        Like the JWT gate, key validation does not re-check the owning account's
+        active state: a key belonging to a deactivated account keeps working
+        until it expires or is revoked.
+
+        No operation is currently wired to this scheme; plugin-facing paths will
+        opt in with `security: - apiKeyAuth: []`.
+
+  schemas:
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Unknown fields are rejected with `400 invalid_body`. The server assigns
+        `role` and `is_active`, so sending them is an error.
+      required:
+        - username
+        - email
+        - password
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 100
+          pattern: '^[A-Za-z0-9_.-]+$'
+          description: |
+            Lower-cased by the server before validation and storage. Letters,
+            digits, underscore, hyphen and dot only.
+          example: alice
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          description: Lower-cased by the server before validation and storage.
+          example: alice@example.com
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 72
+          writeOnly: true
+          description: |
+            At least 8 bytes and at most 72 bytes. Hashed with bcrypt and never
+            returned in any response.
+          example: password123
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - username
+        - password
+      properties:
+        username:
+          type: string
+          description: Case-insensitive; lower-cased by the server before lookup.
+          example: alice
+        password:
+          type: string
+          format: password
+          writeOnly: true
+          example: password123
+
+    LoginResponse:
+      type: object
+      description: |
+        `refresh_token` is shown exactly once and cannot be retrieved again. The
+        server stores only its SHA-256 hash.
+      required:
+        - token
+        - expires_at
+        - refresh_token
+        - refresh_token_expires_at
+        - user
+      properties:
+        token:
+          type: string
+          description: |
+            HS256 JWT. Send as `Authorization: Bearer <token>`.
+        expires_at:
+          type: string
+          format: date-time
+          description: Expiry of `token`, matching its `exp` claim.
+        refresh_token:
+          type: string
+          format: password
+          writeOnly: true
+          description: |
+            Opaque single-use secret: 32 random bytes encoded as unpadded,
+            URL-safe base64 (43 characters). Store it securely and send it only
+            to `/refresh` or `/logout`. Presenting it again after a successful
+            refresh fails, because rotation consumes it.
+          example: 9Xr3kQ1oZ2mW8pY4vB6nC0sD5fG7hJ1lK3nM5pR7tV9
+        refresh_token_expires_at:
+          type: string
+          format: date-time
+          description: |
+            Expiry of `refresh_token`. Defaults to 168 hours after issue and is
+            not extended by failed requests.
+        user:
+          $ref: '#/components/schemas/User'
+
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Authenticates the caller by possession of a refresh token. Used by both
+        `/refresh` and `/logout`.
+      required:
+        - refresh_token
+      properties:
+        refresh_token:
+          type: string
+          format: password
+          writeOnly: true
+          description: |
+            The value returned by the previous `/login` or `/refresh`. It is
+            hashed with SHA-256 and compared against `refresh_tokens.token_hash`;
+            it is never logged.
+          example: 9Xr3kQ1oZ2mW8pY4vB6nC0sD5fG7hJ1lK3nM5pR7tV9
+
+    RefreshResponse:
+      type: object
+      description: |
+        A rotated token pair. Both values are new on every successful refresh;
+        the presented refresh token is consumed by the call. Unlike
+        `LoginResponse`, no `user` object is returned.
+      required:
+        - token
+        - expires_at
+        - refresh_token
+        - refresh_token_expires_at
+      properties:
+        token:
+          type: string
+          description: New HS256 access token, with its own unique `jti`.
+        expires_at:
+          type: string
+          format: date-time
+          description: Expiry of `token`, matching its `exp` claim.
+        refresh_token:
+          type: string
+          format: password
+          writeOnly: true
+          description: |
+            Replacement refresh token. Persist it immediately: the previous value
+            no longer works.
+          example: 1aB2cD4eF6gH8iJ0kL2mN4oP6qR8sT0uV2wX4yZ6aB
+        refresh_token_expires_at:
+          type: string
+          format: date-time
+          description: Expiry of the new `refresh_token`, TTL hours after this call.
+
+    User:
+      type: object
+      description: |
+        Public view of a user. Built from an explicit response struct, so
+        database columns are never exposed by accident. The password hash is
+        never included, and neither is throttle state: exposing `failed_logins`
+        or `locked_until` would tell an attacker how close an account is to
+        being locked.
+      required:
+        - id
+        - username
+        - email
+        - role
+        - is_active
+        - email_verified
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+          readOnly: true
+          example: 1
+        username:
+          type: string
+          example: alice
+        email:
+          type: string
+          format: email
+          example: alice@example.com
+        role:
+          type: string
+          enum:
+            - user
+            - admin
+          description: |
+            `user` for every account created through `/register`. `admin` exists
+            in the schema but cannot be requested by a client.
+          example: user
+        is_active:
+          type: boolean
+          description: Inactive accounts cannot log in.
+          example: true
+        email_verified:
+          type: boolean
+          description: Always `false` until email verification is implemented.
+          example: false
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          example: '2026-11-17T04:02:23.017285+07:00'
+
+    CreateAPIKeyRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Unknown fields are rejected with `400 invalid_body`. The server assigns
+        the key value, prefix, hash, owner and timestamps.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          description: |
+            Trimmed by the server. 1-100 characters (the `api_keys.name` column
+            width). A blank name is rejected rather than defaulted, so every key
+            stays recognisable in a listing.
+          example: CI pipeline
+        scopes:
+          type: array
+          description: |
+            Omitted or empty means `["read"]`. Values are trimmed, lower-cased
+            and deduplicated, and order is preserved. Only these scopes are
+            accepted; this branch stores them but does not enforce them yet.
+          default:
+            - read
+          items:
+            type: string
+            enum:
+              - read
+              - write
+          example:
+            - read
+            - write
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Optional expiry. Must be in the future; `null` or omitted means the
+            key never expires. Stored and returned in UTC.
+          example: '2027-01-01T00:00:00Z'
+
+    APIKey:
+      type: object
+      description: |
+        Public view of an API key. Constructed from an explicit response struct,
+        so the raw key, its hash and the owner user ID are never included. This
+        is also why a listing can be cached or logged safely.
+      required:
+        - id
+        - name
+        - key_prefix
+        - scopes
+        - expires_at
+        - last_used_at
+        - created_at
+      properties:
+        id:
+          type: integer
+          format: int64
+          readOnly: true
+          example: 1
+        name:
+          type: string
+          example: CI pipeline
+        key_prefix:
+          type: string
+          readOnly: true
+          description: |
+            First 12 characters of the raw key (`mk_` plus 9 random characters).
+            Safe to display and to log; not usable as a credential. Two keys
+            sharing a prefix is astronomically unlikely but not prevented.
+          example: mk_9Xr3kQ1o
+        scopes:
+          type: array
+          items:
+            type: string
+            enum:
+              - read
+              - write
+          example:
+            - read
+            - write
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Expiry, or `null` when the key never expires.
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Last time the key authenticated a request, or `null` if it has never
+            been used. Updated on a best-effort, throttled basis, so it may lag
+            the most recent request by up to a minute.
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+    CreateAPIKeyResponse:
+      description: |
+        The created key. `key` is the raw credential and appears only in this
+        response; no endpoint can return it again. The response is sent with
+        `Cache-Control: no-store`.
+      allOf:
+        - $ref: '#/components/schemas/APIKey'
+        - type: object
+          required:
+            - key
+          properties:
+            key:
+              type: string
+              format: password
+              readOnly: true
+              description: |
+                `mk_` followed by 32 random bytes encoded as unpadded URL-safe
+                base64: 46 characters, 256 bits of entropy. Store it in a secret
+                manager; the server keeps only its SHA-256 hash.
+              example: mk_9Xr3kQ1oZ2mW8pY4vB6nC0sD5fG7hJ1lK3nM5pR7tV
+
+    APIKeyListResponse:
+      type: object
+      required:
+        - api_keys
+      properties:
+        api_keys:
+          type: array
+          description: |
+            Active (non-revoked) keys belonging to the authenticated user,
+            newest first. Empty accounts get `[]`, never `null`.
+          items:
+            $ref: '#/components/schemas/APIKey'
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorBody'
+
+    ErrorBody:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: Stable, machine-readable identifier.
+          enum:
+            - invalid_body
+            - invalid_input
+            - username_taken
+            - email_taken
+            - invalid_credentials
+            - account_locked
+            - invalid_refresh_token
+            - unauthorized
+            - payload_too_large
+            - not_found
+            - method_not_allowed
+            - internal_error
+          example: invalid_credentials
+        message:
+          type: string
+          description: Human-readable detail; may change without notice.
+          example: invalid username or password
