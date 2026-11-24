@@ -1,0 +1,135 @@
+# REST Client request collection for the song-recommendation-server API.
+# Requires the VS Code extension "REST Client" (humao.rest-client) and the API
+# listening on http://localhost:8080 (`cd backend; go run ./cmd/api`).
+#
+# Run the blocks top to bottom: later blocks depend on values produced by
+# earlier ones (login -> token/refreshToken, createApiKey -> keyId).
+
+@baseUrl = http://localhost:8080/api/v1
+@host = http://localhost:8080
+
+# Filled in automatically by the "login" request below. VS Code REST Client
+# chains responses through request variables; it has no client.global.set()
+# script API (that syntax belongs to JetBrains' HTTP Client).
+@token = {{login.response.body.$.token}}
+@refreshToken = {{login.response.body.$.refresh_token}}
+
+###
+# Health Check -> 200 {"status":"ok"}
+# /health is registered on the root router, NOT under /api/v1.
+GET {{host}}/health
+
+###
+# Register (Success) -> 201 Created
+# DecodeJSON rejects unknown fields, so send exactly username/email/password.
+# @name register
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{
+  "username": "testuser",
+  "email": "test@example.com",
+  "password": "Password123"
+}
+
+###
+# Register (Duplicate Email) -> 409 email_taken
+# Requires the success block above. Username must differ, email must match.
+POST {{baseUrl}}/auth/register
+Content-Type: application/json
+
+{
+  "username": "testuser2",
+  "email": "test@example.com",
+  "password": "Password123"
+}
+
+###
+# Login (Success) -> 200, populates {{token}} and {{refreshToken}}
+# @name login
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "username": "testuser",
+  "password": "Password123"
+}
+
+###
+# Create API Key -> 201; the raw "key" (mk_...) is returned exactly once
+# Scopes are a closed set: only "read" and "write" (omitted -> ["read"]).
+# @name createApiKey
+POST {{baseUrl}}/api-keys
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "name": "my-first-key",
+  "scopes": ["read", "write"]
+}
+
+###
+# Key ID captured from the create response, used by the revoke block below.
+@keyId = {{createApiKey.response.body.$.id}}
+
+###
+# List API Keys -> 200 {"api_keys": [...]}
+# Prefixes only: the raw key is unrecoverable.
+GET {{baseUrl}}/api-keys
+Authorization: Bearer {{token}}
+
+###
+# Refresh Token -> 200 with a rotated pair
+# The presented token is single-use: running this twice in a row fails with
+# 401 invalid_refresh_token. Re-run Login to reset.
+POST {{baseUrl}}/auth/refresh
+Content-Type: application/json
+
+{
+  "refresh_token": "{{refreshToken}}"
+}
+
+###
+# Logout -> 204 No Content (no body)
+# Consumes the refresh token; idempotent, and any non-empty token is accepted.
+# Run after the refresh block (they share the same token). An empty
+# refresh_token would instead be 400 invalid_input.
+POST {{baseUrl}}/auth/logout
+Content-Type: application/json
+
+{
+  "refresh_token": "{{refreshToken}}"
+}
+
+###
+# Revoke API Key -> 204 No Content
+# Needs the Create API Key block to have run (for {{keyId}}).
+DELETE {{baseUrl}}/api-keys/{{keyId}}
+Authorization: Bearer {{token}}
+
+###
+# Revoke API Key (Unknown ID) -> 404 not_found
+# Identical answer for unknown, foreign-owned and already-revoked keys.
+DELETE {{baseUrl}}/api-keys/999999
+Authorization: Bearer {{token}}
+
+###
+# 404 fallback -> {"error":{"code":"not_found","message":"resource not found"}}
+GET {{baseUrl}}/does-not-exist
+
+###
+# 405 fallback -> {"error":{"code":"method_not_allowed","message":"method not allowed"}}
+# PATCH on a POST-only path. Keep this on the auth subtree: /api-keys is behind
+# RequireAuth, so a wrong method there answers 401 before routing.
+PATCH {{baseUrl}}/auth/login
+
+###
+# Login (Wrong Password) -> 401 invalid_credentials
+# 5 consecutive failures within 15 minutes -> 423 account_locked.
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "username": "testuser",
+  "password": "WrongPassword123"
+}
